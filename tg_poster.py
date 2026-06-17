@@ -1,7 +1,7 @@
 import os, logging
 import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -10,6 +10,7 @@ MY_ID = os.getenv("MY_ID", "")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("bot")
 
 STYLE_PROMPT = """Ты автор Telegram-канала про ИИ и автоматизацию бизнеса. Пиши посты ТОЧНО в таком стиле:
 
@@ -49,136 +50,135 @@ def generate_post(topic):
 def is_owner(update: Update) -> bool:
     return str(update.effective_user.id) == MY_ID
 
-def main_menu():
-    keyboard = [[InlineKeyboardButton("📋 Помощь", callback_data="help")]]
-    return InlineKeyboardMarkup(keyboard)
+KB_PUBLISH = "✅ Опубликовать"
+KB_REGEN = "🔄 Сгенерировать снова"
+KB_CANCEL = "❌ Отмена"
+KB_HELP = "📋 Помощь"
 
-def preview_actions_menu(has_photo):
-    photo_btn_text = "🖼 Заменить фото" if has_photo else "🖼 Добавить фото"
-    keyboard = [
-        [InlineKeyboardButton("✅ Опубликовать", callback_data="approve")],
-        [InlineKeyboardButton("🔄 Сгенерировать снова", callback_data="regenerate")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+def idle_keyboard():
+    return ReplyKeyboardMarkup([[KeyboardButton(KB_HELP)]], resize_keyboard=True)
+
+def preview_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(KB_PUBLISH), KeyboardButton(KB_REGEN)], [KeyboardButton(KB_CANCEL)]],
+        resize_keyboard=True,
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Бот для постинга готов!\n\n"
         "Напиши тему поста текстом — сгенерирую готовый текст.\n"
-        "После этого можешь прислать фото — оно прикрепится к посту перед публикацией.",
-        reply_markup=main_menu(),
+        "После этого можешь прислать фото — оно прикрепится к посту перед публикацией.\n"
+        "Когда всё готово — жми ✅ Опубликовать на клавиатуре внизу.",
+        reply_markup=idle_keyboard(),
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 Как пользоваться:\n\n"
         "1. Напиши тему — получишь готовый текст поста\n"
         "2. (опционально) Пришли фото — оно прикрепится к этому посту\n"
-        "3. Нажми ✅ Опубликовать\n"
-        "4. 🔄 — другой вариант текста, ❌ — отмена"
+        "3. Нажми ✅ Опубликовать на клавиатуре\n"
+        "4. 🔄 — другой вариант текста, ❌ — отмена",
+        reply_markup=idle_keyboard() if not context.user_data.get("pending_text") else preview_keyboard(),
     )
+
+async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = context.user_data.get("pending_text")
+    photo_id = context.user_data.get("pending_photo")
+    if photo_id:
+        await update.message.reply_photo(photo=photo_id, caption=content, reply_markup=preview_keyboard())
+    else:
+        await update.message.reply_text(content, reply_markup=preview_keyboard())
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    topic = update.message.text.strip()
-    if topic.startswith("/"):
+    text = update.message.text.strip()
+
+    if text == KB_HELP:
+        await help_text(update, context)
         return
-    await generate_and_show(update, context, topic)
+    if text == KB_PUBLISH:
+        await do_publish(update, context)
+        return
+    if text == KB_REGEN:
+        await do_regenerate(update, context)
+        return
+    if text == KB_CANCEL:
+        await do_cancel(update, context)
+        return
+    if text.startswith("/"):
+        return
+
+    # любой другой текст = новая тема поста
+    await do_generate(update, context, text)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     photo_id = update.message.photo[-1].file_id
-
-    # Если есть подпись и нет текущего поста - подпись это тема
     caption = (update.message.caption or "").strip()
-    if caption and not context.user_data.get("pending_text"):
-        context.user_data["pending_photo"] = photo_id
-        await generate_and_show(update, context, caption)
-        return
 
     if not context.user_data.get("pending_text"):
-        await update.message.reply_text("Сначала напиши тему поста текстом, потом пришли фото 🙂")
+        if caption:
+            context.user_data["pending_photo"] = photo_id
+            await do_generate(update, context, caption)
+        else:
+            await update.message.reply_text("Сначала напиши тему текстом, или пришли фото с подписью-темой 🙂")
         return
 
     context.user_data["pending_photo"] = photo_id
-    content = context.user_data["pending_text"]
-    await update.message.reply_photo(
-        photo=photo_id,
-        caption=content,
-        reply_markup=preview_actions_menu(True),
-    )
+    await update.message.reply_text("🖼 Фото прикреплено к посту.")
+    await send_preview(update, context)
 
-async def generate_and_show(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str):
+async def do_generate(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str):
     msg = await update.message.reply_text("⏳ Генерирую пост...")
-    content = generate_post(topic)
+    try:
+        content = generate_post(topic)
+    except Exception as e:
+        log.exception("generate error")
+        await msg.edit_text(f"⚠️ Ошибка генерации: {e}")
+        return
     context.user_data["pending_text"] = content
     context.user_data["pending_topic"] = topic
     await msg.delete()
+    await send_preview(update, context)
 
-    photo_id = context.user_data.get("pending_photo")
-    if photo_id:
-        await update.message.reply_photo(photo=photo_id, caption=content, reply_markup=preview_actions_menu(True))
-    else:
-        await update.message.reply_text(
-            content + "\n\n💡 Можешь прислать фото — прикреплю к этому посту.",
-            reply_markup=preview_actions_menu(False),
-        )
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if str(query.from_user.id) != MY_ID:
-        await query.answer()
+async def do_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = context.user_data.get("pending_topic")
+    if not topic:
+        await update.message.reply_text("Нет темы для повторной генерации.", reply_markup=idle_keyboard())
         return
-    await query.answer()
+    await update.message.reply_text("⏳ Генерирую новый вариант...")
+    content = generate_post(topic)
+    context.user_data["pending_text"] = content
+    await send_preview(update, context)
 
-    if query.data == "help":
-        await help_command(update, context)
+async def do_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    content = context.user_data.get("pending_text")
+    photo_id = context.user_data.get("pending_photo")
+    if not content:
+        await update.message.reply_text("Нет поста для публикации. Сначала напиши тему.", reply_markup=idle_keyboard())
+        return
+    if photo_id:
+        await context.bot.send_photo(chat_id=CHANNEL_ID, photo=photo_id, caption=content)
+    else:
+        await context.bot.send_message(chat_id=CHANNEL_ID, text=content)
+    context.user_data["pending_text"] = None
+    context.user_data["pending_photo"] = None
+    context.user_data["pending_topic"] = None
+    await update.message.reply_text("✅ Пост опубликован в канал!", reply_markup=idle_keyboard())
 
-    elif query.data == "approve":
-        content = context.user_data.get("pending_text")
-        photo_id = context.user_data.get("pending_photo")
-        if not content:
-            await query.message.reply_text("Нет поста для публикации. Сначала напиши тему.")
-            return
-        if photo_id:
-            await context.bot.send_photo(chat_id=CHANNEL_ID, photo=photo_id, caption=content)
-        else:
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=content)
-        context.user_data["pending_text"] = None
-        context.user_data["pending_photo"] = None
-        context.user_data["pending_topic"] = None
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("✅ Пост опубликован в канал!")
-
-    elif query.data == "regenerate":
-        topic = context.user_data.get("pending_topic")
-        if not topic:
-            await query.message.reply_text("Нет темы для повторной генерации.")
-            return
-        await query.message.reply_text("⏳ Генерирую новый вариант...")
-        content = generate_post(topic)
-        context.user_data["pending_text"] = content
-        photo_id = context.user_data.get("pending_photo")
-        if photo_id:
-            await query.message.reply_photo(photo=photo_id, caption=content, reply_markup=preview_actions_menu(True))
-        else:
-            await query.message.reply_text(content, reply_markup=preview_actions_menu(False))
-
-    elif query.data == "cancel":
-        context.user_data["pending_text"] = None
-        context.user_data["pending_photo"] = None
-        context.user_data["pending_topic"] = None
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("❌ Отменено.")
+async def do_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["pending_text"] = None
+    context.user_data["pending_photo"] = None
+    context.user_data["pending_topic"] = None
+    await update.message.reply_text("❌ Отменено.", reply_markup=idle_keyboard())
 
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CallbackQueryHandler(button_handler))
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+app.add_handler(MessageHandler(filters.TEXT, handle_text))
 print("🤖 Бот запущен!")
 app.run_polling()
