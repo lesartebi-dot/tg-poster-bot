@@ -33,7 +33,7 @@ STYLE_PROMPT = """Ты пишешь посты для Telegram-канала АП
 - СТРОГО до 850 символов всего текста — это жёсткий лимит, считай символы
 - Короткие абзацы с пустыми строками между ними
 
-ЗАПРЕЩЕНО: эмодзи в заголовке, восклицательные знаки, разговорный тон, превышение 850 символов""" 
+ЗАПРЕЩЕНО: эмодзи в заголовке, восклицательные знаки, разговорный тон, превышение 850 символов"""
 
 def generate_post(topic):
     resp = requests.post(
@@ -47,7 +47,6 @@ def generate_post(topic):
     )
     resp.raise_for_status()
     text = resp.json()["choices"][0]["message"]["content"].strip()
-    # подстраховка - жёстко обрезаем если модель не уложилась
     if len(text) > CAPTION_LIMIT:
         text = text[:CAPTION_LIMIT - 1].rsplit(" ", 1)[0] + "…"
     return text
@@ -56,6 +55,7 @@ def is_owner(update: Update) -> bool:
     return str(update.effective_user.id) == MY_ID
 
 KB_NEW = "✍️ Новый пост"
+KB_ATTACH = "📎 Прикрепить фото/видео"
 KB_PUBLISH = "✅ Опубликовать"
 KB_REGEN = "🔄 Сгенерировать снова"
 KB_REMOVE_MEDIA = "🗑 Убрать медиа"
@@ -69,6 +69,8 @@ def preview_keyboard(has_media: bool):
     rows = [[KeyboardButton(KB_PUBLISH), KeyboardButton(KB_REGEN)]]
     if has_media:
         rows.append([KeyboardButton(KB_REMOVE_MEDIA)])
+    else:
+        rows.append([KeyboardButton(KB_ATTACH)])
     rows.append([KeyboardButton(KB_CANCEL)])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -80,7 +82,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Бот для постинга АПЭТ готов.\n\n"
         "Нажми ✍️ Новый пост и пришли тему.\n"
-        "После генерации текста можешь прислать фото или видео — прикреплю прямо к посту одним сообщением.\n"
+        "После генерации текста нажми 📎 Прикрепить фото/видео или просто пришли файл.\n"
         "Когда всё готово — жми ✅ Опубликовать.",
         reply_markup=idle_keyboard(),
     )
@@ -89,7 +91,7 @@ async def help_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 Как пользоваться:\n\n"
         "✍️ Новый пост — начать с темы\n"
-        "Пришли фото или видео — прикрепится прямо к посту\n"
+        "📎 Прикрепить фото/видео — добавить медиа к посту\n"
         "✅ Опубликовать — отправить в канал одним сообщением\n"
         "🔄 Сгенерировать снова — другой вариант текста\n"
         "🗑 Убрать медиа — снять прикреплённое фото/видео\n"
@@ -126,6 +128,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == KB_NEW:
         await update.message.reply_text("Напиши тему поста:")
         return
+    if text == KB_ATTACH:
+        if not context.user_data.get("pending_text"):
+            await update.message.reply_text("Сначала создай пост через ✍️ Новый пост.")
+            return
+        context.user_data["awaiting_media"] = True
+        await update.message.reply_text("📎 Пришли фото или видео для этого поста:")
+        return
     if text == KB_PUBLISH:
         await do_publish(update, context); return
     if text == KB_REGEN:
@@ -153,7 +162,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif update.message.video:
             v = update.message.video
             if v.file_size and v.file_size > 50 * 1024 * 1024:
-                await update.message.reply_text("⚠️ Видео больше 50 МБ — бот не сможет его отправить. Сожми видео.")
+                await update.message.reply_text("⚠️ Видео больше 50 МБ — сожми и пришли заново.")
                 return
             file_id = v.file_id
             kind = "video"
@@ -164,6 +173,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("handle_media error")
         await update.message.reply_text(f"⚠️ Не смог обработать файл: {e}")
         return
+
+    context.user_data["awaiting_media"] = False
 
     if not context.user_data.get("pending_text"):
         if caption:
