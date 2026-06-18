@@ -1,6 +1,7 @@
 import os, logging
 import requests
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -15,27 +16,22 @@ log = logging.getLogger("bot")
 STYLE_PROMPT = """Ты пишешь посты для Telegram-канала АПЭТ (ассоциация продавцов электронной торговли) — про e-commerce, маркетплейсы, продавцов, регулирование рынка и инвестиции.
 
 СТРУКТУРА:
-1. Заголовок — короткий, по существу, без эмодзи и кликбейта (например: "Цифровые платформы как инфраструктура для роста продавцов")
-2. Вводный абзац — что произошло (конференция, сессия, исследование) и о чём в целом речь
-3. Раскрытие темы — 2-4 абзаца аналитики: почему это важно, что изменилось для рынка, какой контекст
-4. Список через 🔹 — конкретные пункты, направления или инструменты (3-9 пунктов)
-5. Абзац "Для селлеров это..." — практический вывод, что это значит для продавцов
-6. Абзац от лица АПЭТ — "Мы в АПЭТ считаем..." / "Для АПЭТ это важное направление..." — позиция организации
-7. Финал — короткий итоговый тезис, без эмодзи-восклицаний
+1. Заголовок — короткий, по существу, без эмодзи и кликбейта
+2. Вводный абзац — что произошло (конференция, сессия, исследование) и о чём речь
+3. Раскрытие темы — 2-4 абзаца аналитики
+4. Список через 🔹 — конкретные пункты (3-9 штук)
+5. Абзац "Для селлеров это..." — практический вывод
+6. Абзац от лица АПЭТ — "Мы в АПЭТ считаем..."
+7. Финал — короткий итоговый тезис
 
 СТИЛЬ:
-- Деловой, экспертный, спокойный тон — НЕ разговорный, без "ты", обращение нейтральное
-- Никакого кликбейта, провокаций, восклицательных знаков в заголовке
-- Эмодзи используются ТОЛЬКО как маркеры списка (🔹) и в самом конце для ссылок (🛒💙📷🌟) — больше нигде
-- Термины: маркетплейсы, селлеры, МСП, ПВЗ, e-commerce, платформенная экономика
-- Длина: 300-450 слов
-- Структура с короткими абзацами (1-3 предложения), много пустых строк между ними
+- Деловой, экспертный, спокойный тон, без "ты"
+- Без кликбейта и восклицательных знаков
+- Эмодзи только как маркеры списка 🔹
+- Термины: маркетплейсы, селлеры, МСП, ПВЗ, e-commerce
+- Длина: 300-450 слов, короткие абзацы с пустыми строками между ними
 
-ЗАПРЕЩЕНО:
-- Эмодзи в заголовке или тексте абзацев
-- Восклицательные знаки
-- Разговорный тон, обращение на "ты"
-- Слова "хайп", "вау", "крутой", "топ" """
+ЗАПРЕЩЕНО: эмодзи в заголовке, восклицательные знаки, разговорный тон, слова "хайп", "вау", "крутой", "топ" """
 
 def generate_post(topic):
     resp = requests.post(
@@ -97,16 +93,24 @@ async def help_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     content = context.user_data.get("pending_text")
-    media = context.user_data.get("pending_media")  # (type, file_id) или None
+    media = context.user_data.get("pending_media")
     kb = preview_keyboard(bool(media))
-    if media:
-        kind, file_id = media
-        if kind == "photo":
-            await update.message.reply_photo(photo=file_id, caption=content, reply_markup=kb)
+    try:
+        if media:
+            kind, file_id = media
+            if kind == "photo":
+                await update.message.reply_photo(photo=file_id, caption=content, reply_markup=kb)
+            else:
+                await update.message.reply_video(video=file_id, caption=content, reply_markup=kb, write_timeout=120, read_timeout=120)
         else:
-            await update.message.reply_video(video=file_id, caption=content, reply_markup=kb)
-    else:
-        await update.message.reply_text(content, reply_markup=kb)
+            await update.message.reply_text(content, reply_markup=kb)
+    except TelegramError as e:
+        log.exception("send_preview failed")
+        context.user_data["pending_media"] = None
+        await update.message.reply_text(
+            f"⚠️ Не получилось показать медиа ({e}). Текст поста сохранён без медиа:",
+        )
+        await update.message.reply_text(content, reply_markup=preview_keyboard(False))
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -116,7 +120,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == KB_HELP:
         await help_text(update, context); return
     if text == KB_NEW:
-        context.user_data["awaiting_topic"] = True
         await update.message.reply_text("Напиши тему поста:")
         return
     if text == KB_PUBLISH:
@@ -133,22 +136,29 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
 
-    # обычный текст = тема нового поста (всегда, для удобства)
     await do_generate(update, context, text)
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        kind = "photo"
+    try:
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            kind = "photo"
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            kind = "video"
+            # Telegram bot API limit ~50MB на отправку файлов ботом
+            if update.message.video.file_size and update.message.video.file_size > 50 * 1024 * 1024:
+                await update.message.reply_text("⚠️ Видео больше 50 МБ — бот не сможет его отправить. Сожми видео и пришли заново.")
+                return
+        else:
+            return
         caption = (update.message.caption or "").strip()
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        kind = "video"
-        caption = (update.message.caption or "").strip()
-    else:
+    except Exception as e:
+        log.exception("handle_media error reading message")
+        await update.message.reply_text(f"⚠️ Не смог обработать файл: {e}")
         return
 
     if not context.user_data.get("pending_text"):
@@ -183,7 +193,12 @@ async def do_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет темы для повторной генерации.", reply_markup=idle_keyboard())
         return
     await update.message.reply_text("⏳ Генерирую новый вариант...")
-    content = generate_post(topic)
+    try:
+        content = generate_post(topic)
+    except Exception as e:
+        log.exception("regenerate error")
+        await update.message.reply_text(f"⚠️ Ошибка генерации: {e}")
+        return
     context.user_data["pending_text"] = content
     await send_preview(update, context)
 
@@ -193,14 +208,19 @@ async def do_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not content:
         await update.message.reply_text("Нет поста для публикации. Нажми ✍️ Новый пост.", reply_markup=idle_keyboard())
         return
-    if media:
-        kind, file_id = media
-        if kind == "photo":
-            await context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=content)
+    try:
+        if media:
+            kind, file_id = media
+            if kind == "photo":
+                await context.bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=content)
+            else:
+                await context.bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=content, write_timeout=120, read_timeout=120)
         else:
-            await context.bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=content)
-    else:
-        await context.bot.send_message(chat_id=CHANNEL_ID, text=content)
+            await context.bot.send_message(chat_id=CHANNEL_ID, text=content)
+    except TelegramError as e:
+        log.exception("publish failed")
+        await update.message.reply_text(f"⚠️ Не удалось опубликовать: {e}\nПопробуй ещё раз или убери медиа (🗑 Убрать медиа) и опубликуй текстом.")
+        return
     context.user_data.clear()
     await update.message.reply_text("✅ Пост опубликован в канал!", reply_markup=idle_keyboard())
 
@@ -213,4 +233,4 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
 app.add_handler(MessageHandler(filters.TEXT, handle_text))
 print("🤖 Бот запущен!")
-app.run_polling()
+app.run_polling(read_timeout=60, write_timeout=60)
